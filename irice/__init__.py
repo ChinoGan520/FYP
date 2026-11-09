@@ -1,8 +1,10 @@
 """Flask application factory for the I-RICE exhibition management system."""
 import os
 import secrets
+import socket
 from datetime import timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -16,8 +18,31 @@ from .extensions import csrf, db
 
 @event.listens_for(Engine, "connect")
 def _sqlite_foreign_keys(connection, _record):
-    if connection.__class__.module.startswith("sqlite3"):
+    if connection.__class__.__module__.startswith("sqlite3"):
         connection.execute("PRAGMA foreign_keys=ON")
+
+
+# 模組層級的 DNS 快取，防止在高併發時反覆呼叫 C 函式庫引發 [Errno 16]
+_DNS_CACHE = {}
+
+def _resolve_host_to_ip(db_url):
+    """動態解析資料庫主機名稱為當前真實 IP，避免逾時與 [Errno 16]"""
+    if not db_url or not db_url.startswith("mysql"):
+        return db_url
+    try:
+        parsed = urlparse(db_url)
+        hostname = parsed.hostname
+        if not hostname or hostname in ("localhost", "127.0.0.1"):
+            return db_url
+
+        if hostname not in _DNS_CACHE:
+            _DNS_CACHE[hostname] = socket.gethostbyname(hostname)
+
+        cached_ip = _DNS_CACHE[hostname]
+        netloc = parsed.netloc.replace(hostname, cached_ip)
+        return urlunparse(parsed._replace(netloc=netloc))
+    except Exception:
+        return db_url
 
 
 def create_app(test_config=None):
@@ -67,12 +92,9 @@ def create_app(test_config=None):
     if len(secret) < 32 or secret.startswith("REPLACE_WITH"):
         secret = "fallback_secret_key_for_vercel_deployment_min_32_chars"
 
-    # 取得資料庫 URL，並自動將網域名稱替換為固定 IP 以繞過 Vercel [Errno 16] DNS 解析錯誤
-    db_uri = os.environ.get("DATABASE_URL", "sqlite:///irice.db")
-    if "irice-irice.e.aivencloud.com" in db_uri:
-        db_uri = db_uri.replace("irice-irice.e.aivencloud.com", "159.65.148.27")
-    elif "irice-irice.aivencloud.com" in db_uri:
-        db_uri = db_uri.replace("irice-irice.aivencloud.com", "159.65.148.27")
+    # 動態解析當前最新 IP，不寫死過期的靜態位址
+    raw_db_uri = os.environ.get("DATABASE_URL", "sqlite:///irice.db")
+    db_uri = _resolve_host_to_ip(raw_db_uri)
 
     app.config.from_mapping(
         SECRET_KEY=secret,
@@ -80,11 +102,13 @@ def create_app(test_config=None):
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SQLALCHEMY_ENGINE_OPTIONS={
             "pool_pre_ping": True,
+            "pool_recycle": 280,
             "connect_args": {
+                "connect_timeout": 10,
                 "ssl": {
                     "check_hostname": False,
                     "verify_mode": 0,
-                }
+                },
             },
         },
         MAX_CONTENT_LENGTH=8 * 1024 * 1024,
@@ -125,7 +149,11 @@ def create_app(test_config=None):
     @app.context_processor
     def shared_context():
         from .models import Category
-        return {"current_user": getattr(g, "user", None), "categories": db.session.scalars(db.select(Category).order_by(Category.name)).all()}
+        try:
+            cats = db.session.scalars(db.select(Category).order_by(Category.name)).all()
+        except Exception:
+            cats = []
+        return {"current_user": getattr(g, "user", None), "categories": cats}
 
     @app.template_filter("datetime")
     def format_datetime(value, fmt="%d %b %Y, %I:%M %p"):
@@ -145,9 +173,9 @@ def create_app(test_config=None):
         try:
             db.session.execute(text("SELECT 1"))
             return jsonify(status="ok", database="connected")
-        except Exception:
+        except Exception as e:
             db.session.rollback()
-            return jsonify(status="error", database="unavailable"), 503
+            return jsonify(status="error", database="unavailable", error=str(e)), 503
 
     @app.get("/setup-admin")
     def setup_admin():
@@ -176,7 +204,7 @@ def create_app(test_config=None):
             return jsonify(
                 status="success",
                 message="Organiser account created successfully!",
-                credentials={"username": target_username, "password": "gan072891251"}
+                credentials={"username": target_username, "password": "gan072891251"},
             )
         return jsonify(status="info", message="Admin account already exists.")
 
