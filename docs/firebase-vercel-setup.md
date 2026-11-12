@@ -45,7 +45,7 @@ npx --yes firebase-tools@15.36.0 deploy --only "firestore:rules,firestore:indexe
 
 ## 3. 设置 Vercel 环境变量
 
-在 Vercel 导入 `ganchengjun/FYP`，或打开已有项目的 **Settings → Environment Variables**。确认部署分支已经包含本次 Firestore 版本，项目根目录能看到 `app.py` 与 `requirements.txt`。
+在 Vercel 导入 `ChinoGan520/FYP`，或打开已有项目的 **Settings → Environment Variables**。确认部署分支已经包含本次 Firestore 版本，项目根目录能看到 `app.py` 与 `requirements.txt`。
 
 设置以下变量。至少应用到 **Production**；要使用 Preview 部署，也应对 Preview 安全配置对应值。
 
