@@ -1,30 +1,28 @@
-"""Single-event models. Attendance always counts registered accounts, not team members."""
+"""Firestore domain records. Relationships are resolved through the repository."""
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-
+from typing import ClassVar
 from werkzeug.security import check_password_hash, generate_password_hash
-
-from .extensions import db
 
 
 def utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-class User(db.Model):
-    __tablename__ = "users"
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(120), nullable=False)
-    email = db.Column(db.String(254), nullable=False, unique=True)
-    password_hash = db.Column(db.String(255), nullable=False)
-    role = db.Column(db.String(20), nullable=False, default="exhibitor")
-    organization = db.Column(db.String(180), nullable=False, default="")
-    phone = db.Column(db.String(40), nullable=False, default="")
-    approval_status = db.Column(db.String(20), nullable=False, default="pending")
-    review_comment = db.Column(db.Text, nullable=False, default="")
-    token_version = db.Column(db.Integer, nullable=False, default=1)
-    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
-    team = db.relationship("Team", back_populates="user", uselist=False, cascade="all, delete-orphan")
-    checkin = db.relationship("CheckIn", foreign_keys="CheckIn.user_id", back_populates="user", uselist=False)
+@dataclass
+class User:
+    __collection__: ClassVar[str] = 'users'
+    id: int | None = None
+    name: str = ''
+    email: str = ''
+    password_hash: str = ''
+    role: str = 'exhibitor'
+    organization: str = ''
+    phone: str = ''
+    approval_status: str = 'pending'
+    review_comment: str = ''
+    token_version: int = 1
+    created_at: datetime = field(default_factory=utcnow)
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -32,70 +30,127 @@ class User(db.Model):
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
 
+    @property
+    def team(self):
+        from .repository import repo
+        return repo.first(Team, user_id=self.id)
 
-class Team(db.Model):
-    __tablename__ = "teams"
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, unique=True)
-    name = db.Column(db.String(120), nullable=False)
-    institution = db.Column(db.String(180), nullable=False, default="")
-    members = db.Column(db.Text, nullable=False, default="")
-    user = db.relationship("User", back_populates="team")
-    project = db.relationship("Project", back_populates="team", uselist=False, cascade="all, delete-orphan")
-
-
-class Category(db.Model):
-    __tablename__ = "categories"
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(80), nullable=False, unique=True)
-    description = db.Column(db.String(240), nullable=False, default="")
-    color = db.Column(db.String(7), nullable=False, default="#167d75")
+    @property
+    def checkin(self):
+        from .repository import repo
+        return repo.first(CheckIn, user_id=self.id)
 
 
-class Project(db.Model):
-    __tablename__ = "projects"
-    id = db.Column(db.Integer, primary_key=True)
-    team_id = db.Column(db.Integer, db.ForeignKey("teams.id"), nullable=False, unique=True)
-    category_id = db.Column(db.Integer, db.ForeignKey("categories.id"), nullable=False)
-    title = db.Column(db.String(180), nullable=False)
-    abstract = db.Column(db.Text, nullable=False)
-    requirements = db.Column(db.Text, nullable=False, default="")
-    poster_filename = db.Column(db.String(120), nullable=True)
-    status = db.Column(db.String(20), nullable=False, default="pending", index=True)
-    review_comment = db.Column(db.Text, nullable=False, default="")
-    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
-    reviewed_at = db.Column(db.DateTime, nullable=True)
-    team = db.relationship("Team", back_populates="project")
-    category = db.relationship("Category")
-    booth = db.relationship("Booth", back_populates="project", uselist=False)
+@dataclass
+class Team:
+    __collection__: ClassVar[str] = 'teams'
+    id: int | None = None
+    user_id: int | None = None
+    name: str = ''
+    institution: str = ''
+    members: str = ''
+
+    @property
+    def user(self):
+        from .repository import repo
+        return repo.get(User, self.user_id)
+
+    @property
+    def project(self):
+        from .repository import repo
+        return repo.first(Project, team_id=self.id)
 
 
-class Booth(db.Model):
-    __tablename__ = "booths"
-    id = db.Column(db.Integer, primary_key=True)
-    code = db.Column(db.String(24), nullable=False, unique=True)
-    category_id = db.Column(db.Integer, db.ForeignKey("categories.id"), nullable=True)
-    location = db.Column(db.String(120), nullable=False, default="Exhibition hall")
-    project_id = db.Column(db.Integer, db.ForeignKey("projects.id"), nullable=True, unique=True)
-    project = db.relationship("Project", back_populates="booth")
-    category = db.relationship("Category")
+@dataclass
+class Category:
+    __collection__: ClassVar[str] = 'categories'
+    id: int | None = None
+    name: str = ''
+    description: str = ''
+    color: str = '#167d75'
 
 
-class CheckIn(db.Model):
-    __tablename__ = "check_ins"
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, unique=True)
-    scanner_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
-    user = db.relationship("User", foreign_keys=[user_id], back_populates="checkin")
-    scanner = db.relationship("User", foreign_keys=[scanner_id])
+@dataclass
+class Project:
+    __collection__: ClassVar[str] = 'projects'
+    id: int | None = None
+    team_id: int | None = None
+    category_id: int | None = None
+    title: str = ''
+    abstract: str = ''
+    requirements: str = ''
+    poster_filename: str | None = None
+    status: str = 'pending'
+    review_comment: str = ''
+    booth_id: int | None = None
+    created_at: datetime = field(default_factory=utcnow)
+    reviewed_at: datetime | None = None
+
+    @property
+    def team(self):
+        from .repository import repo
+        return repo.get(Team, self.team_id)
+
+    @property
+    def category(self):
+        from .repository import repo
+        return repo.get(Category, self.category_id)
+
+    @property
+    def booth(self):
+        from .repository import repo
+        return repo.get(Booth, self.booth_id) if self.booth_id else None
 
 
-class AuditLog(db.Model):
-    __tablename__ = "audit_logs"
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    action = db.Column(db.String(80), nullable=False)
-    details = db.Column(db.Text, nullable=False, default="")
-    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
-    user = db.relationship("User")
+@dataclass
+class Booth:
+    __collection__: ClassVar[str] = 'booths'
+    id: int | None = None
+    code: str = ''
+    category_id: int | None = None
+    location: str = 'Exhibition hall'
+    project_id: int | None = None
+
+    @property
+    def project(self):
+        from .repository import repo
+        return repo.get(Project, self.project_id)
+
+    @property
+    def category(self):
+        from .repository import repo
+        return repo.get(Category, self.category_id)
+
+
+@dataclass
+class CheckIn:
+    __collection__: ClassVar[str] = 'check_ins'
+    id: int | None = None
+    user_id: int | None = None
+    scanner_id: int | None = None
+    created_at: datetime = field(default_factory=utcnow)
+
+    @property
+    def user(self):
+        from .repository import repo
+        return repo.get(User, self.user_id)
+
+    @property
+    def scanner(self):
+        from .repository import repo
+        return repo.get(User, self.scanner_id)
+
+
+@dataclass
+class AuditLog:
+    __collection__: ClassVar[str] = 'audit_logs'
+    id: int | None = None
+    user_id: int | None = None
+    action: str = ''
+    details: str = ''
+    created_at: datetime = field(default_factory=utcnow)
+
+    @property
+    def user(self):
+        from .repository import repo
+        return repo.get(User, self.user_id)

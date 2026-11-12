@@ -4,9 +4,8 @@ from functools import wraps
 from urllib.parse import urlsplit
 
 from flask import Blueprint, abort, flash, g, redirect, render_template, request, session, url_for
-from sqlalchemy.exc import IntegrityError
 
-from .extensions import db
+from .repository import DuplicateValue, repo
 from .models import Team, User
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
@@ -15,7 +14,9 @@ bp = Blueprint("auth", __name__, url_prefix="/auth")
 @bp.before_app_request
 def load_user():
     user_id = session.get("user_id")
-    g.user = db.session.get(User, user_id) if isinstance(user_id, int) else None
+    g.user = None
+    if isinstance(user_id, int) and request.endpoint != 'health':
+        g.user = repo.get(User, user_id)
 
 
 def login_required(view):
@@ -63,15 +64,22 @@ def register():
             return render_template("auth/register.html"), 400
         user = User(name=name, email=email, role=role, organization=organization)
         user.set_password(password)
-        db.session.add(user)
-        if role == "exhibitor":
-            user.team = Team(name=f"{name[:100]}'s team", institution=organization)
+        def create_account():
+            if repo.first(User, email=email):
+                raise DuplicateValue('Email already registered.')
+            # Allocate inside each transaction attempt; aborted retries must not
+            # retain an ID allocated by an uncommitted counter update.
+            account = User(name=name, email=email, role=role, organization=organization, password_hash=user.password_hash)
+            repo.save(account)
+            repo.reserve_unique('emails', email, account.id)
+            if role == 'exhibitor':
+                repo.save(Team(user_id=account.id, name=f"{name[:100]}'s team", institution=organization))
+            return account
         try:
-            db.session.commit()
-        except IntegrityError:
-            db.session.rollback()
-            flash("An account with that email already exists. Sign in instead.", "error")
-            return render_template("auth/register.html"), 400
+            user = repo.atomic(create_account)
+        except DuplicateValue:
+            flash('An account with that email already exists. Sign in instead.', 'error')
+            return render_template('auth/register.html'), 400
         session.clear()
         session["user_id"] = user.id
         session.permanent = True
@@ -87,7 +95,7 @@ def login():
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
-        user = db.session.scalar(db.select(User).where(User.email == email))
+        user = repo.first(User, email=email)
         if not user or len(password) > 128 or not user.check_password(password):
             flash("The email or password is incorrect.", "error")
             return render_template("auth/login.html"), 401

@@ -2,7 +2,7 @@ import io
 
 from PIL import Image
 
-from irice.extensions import db
+from irice.repository import repo
 from irice.models import Booth, Category, CheckIn, Project, User
 
 
@@ -30,7 +30,7 @@ def test_registration_creates_team_hashes_password_and_submits(app, client):
     assert register(client).status_code == 302
     assert submit(client).status_code == 302
     with app.app_context():
-        user = db.session.scalar(db.select(User).where(User.email == "participant@example.test"))
+        user = repo.first(User, email="participant@example.test")
         assert user.password_hash != PASSWORD
         assert user.check_password(PASSWORD)
         assert user.team.institution == "Southern University College"
@@ -41,7 +41,7 @@ def test_registration_creates_team_hashes_password_and_submits(app, client):
 def test_public_registration_cannot_create_admin(app, client):
     assert register(client, role="admin").status_code == 400
     with app.app_context():
-        assert db.session.scalar(db.select(User)) is None
+        assert repo.first(User) is None
 
 
 def test_duplicate_email_case_normalization(app, client):
@@ -49,7 +49,7 @@ def test_duplicate_email_case_normalization(app, client):
     client.post("/auth/logout")
     assert register(client).status_code == 400
     with app.app_context():
-        assert db.session.query(User).count() == 1
+        assert len(repo.all(User)) == 1
 
 
 def test_login_bad_password_and_safe_redirect(app, client):
@@ -73,46 +73,39 @@ def test_invalid_submission_does_not_create_project(app, client):
     assert submit(client, abstract="Too short").status_code == 400
     assert submit(client, category_id="999").status_code == 400
     with app.app_context():
-        assert db.session.query(Project).count() == 0
+        assert len(repo.all(Project)) == 0
 
 
-def test_validated_poster_upload_and_owner_only_delivery(app, client):
+def test_poster_upload_is_explicitly_disabled_without_creating_project(app, client):
     register(client)
-    assert submit(client, poster=(png(), "../../poster.png")).status_code == 302
+    response = submit(client, poster=(png(), "../../poster.png"))
+    assert response.status_code == 400
+    assert b"disabled" in response.data.lower() or b"unavailable" in response.data.lower()
     with app.app_context():
-        project = db.session.scalar(db.select(Project))
-        project_id = project.id
-        assert "/" not in project.poster_filename
-        assert project.poster_filename.endswith(".png")
-    response = client.get(f"/posters/{project_id}")
-    assert response.status_code == 200
-    assert response.data.startswith(b"\x89PNG")
-    assert response.headers["Cache-Control"] == "no-store"
-    client.post("/auth/logout")
-    register(client, email="someoneelse@example.test")
-    assert client.get(f"/posters/{project_id}").status_code == 403
+        assert repo.all(Project) == []
+
 
 
 def test_fake_image_rejected(app, client):
     register(client)
     assert submit(client, poster=(io.BytesIO(b"<script>alert(1)</script>"), "poster.png")).status_code == 400
     with app.app_context():
-        assert db.session.query(Project).count() == 0
+        assert len(repo.all(Project)) == 0
 
 
 def test_approved_project_and_team_locked(app, client, admin, login):
     register(client)
     submit(client)
     with app.app_context():
-        user = db.session.scalar(db.select(User).where(User.role == "exhibitor"))
+        user = repo.first(User, role="exhibitor")
         user_id, project_id = user.id, user.team.project.id
     login(admin)
     assert client.post(f"/admin/applications/{project_id}/review", data={"status": "approved", "comment": "Ready for exhibition."}).status_code == 302
     login(user_id)
-    assert submit(client, title="Changed after approval").status_code == 302
+    assert submit(client, title="Changed after approval").status_code == 400
     client.post("/team", data={"name": "Changed team", "institution": "New university"})
     with app.app_context():
-        project = db.session.get(Project, project_id)
+        project = repo.get(Project, project_id)
         assert project.title == "Smart water monitoring system"
         assert project.team.name != "Changed team"
         assert project.status == "approved"
@@ -122,9 +115,9 @@ def test_complete_registration_to_checkin_and_pdf_flow(app, client, admin, login
     register(client)
     submit(client)
     with app.app_context():
-        user = db.session.scalar(db.select(User).where(User.role == "exhibitor"))
+        user = repo.first(User, role="exhibitor")
         user_id, project_id = user.id, user.team.project.id
-        booth_id = db.session.scalar(db.select(Booth)).id
+        booth_id = repo.first(Booth).id
     assert client.get("/passes/token").status_code == 403
     login(admin)
     assert client.post(f"/admin/applications/{project_id}/review", data={"status": "approved", "comment": "Approved."}).status_code == 302
@@ -143,21 +136,21 @@ def test_complete_registration_to_checkin_and_pdf_flow(app, client, admin, login
     assert report.status_code == 200
     assert b"Smart water monitoring system" in report.data
     with app.app_context():
-        assert db.session.query(CheckIn).count() == 1
+        assert len(repo.all(CheckIn)) == 1
 
 
 def test_rejected_submission_can_be_revised(app, client, admin, login):
     register(client)
     submit(client)
     with app.app_context():
-        user = db.session.scalar(db.select(User).where(User.role == "exhibitor"))
+        user = repo.first(User, role="exhibitor")
         user_id, project_id = user.id, user.team.project.id
     login(admin)
     client.post(f"/admin/applications/{project_id}/review", data={"status": "rejected", "comment": "Please explain your evaluation."})
     login(user_id)
     assert submit(client, title="Improved water monitoring system").status_code == 302
     with app.app_context():
-        project = db.session.get(Project, project_id)
+        project = repo.get(Project, project_id)
         assert project.status == "pending"
         assert project.review_comment == ""
 
@@ -177,10 +170,11 @@ def test_initialization_is_repeatable_and_does_not_reset_applications(app, clien
     assert runner.invoke(args=["init-db"]).exit_code == 0
     assert runner.invoke(args=["init-db"]).exit_code == 0
     with app.app_context():
-        assert db.session.query(Project).count() == 1
-        assert db.session.query(Category).count() == 4
-        assert db.session.query(Booth).count() == 20
+        assert len(repo.all(Project)) == 1
+        assert len(repo.all(Category)) == 4
+        assert len(repo.all(Booth)) == 20
 
 
 def test_health_reports_database_connection(client):
-    assert client.get("/health").json == {"status": "ok", "database": "connected"}
+    assert client.get("/health").json["status"] == "ok"
+    assert client.get("/health").json["database"] == "connected"

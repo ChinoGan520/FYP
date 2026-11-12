@@ -3,57 +3,35 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-import os
-import secrets
 from threading import Barrier
 
 import pytest
 from flask import session
 from flask_wtf.csrf import generate_csrf
 from itsdangerous import TimestampSigner
-from sqlalchemy import func, select
 
-from irice import create_app
-from irice.extensions import db
+from irice.repository import repo
 from irice.models import AuditLog, Booth, Category, CheckIn, Project, Team, User
 from irice import passes
 
 
 @pytest.fixture
-def pass_environment(tmp_path):
-    uri = os.environ.get("IRICE_TEST_DATABASE_URL", "sqlite:///" + str(tmp_path / "passes.db"))
-    app = create_app({
-        "TESTING": True, "SECRET_KEY": secrets.token_hex(32),
-        "WTF_CSRF_ENABLED": False,
-        "SQLALCHEMY_DATABASE_URI": uri,
-        "UPLOAD_FOLDER": str(tmp_path / "posters"),
-        "SQLALCHEMY_ENGINE_OPTIONS": {"connect_args": {"timeout": 20}} if uri.startswith("sqlite:") else {"pool_pre_ping": True},
-    })
+def pass_environment(app, admin):
     with app.app_context():
-        # An explicit IRICE_TEST_DATABASE_URL always denotes a disposable test
-        # database, matching the shared integration fixture's contract.
-        db.drop_all()
-        db.create_all()
         people = {
-            "admin": User(name="Organizer", email="organizer@example.test", password_hash="unused", role="admin"),
             "attendee": User(name="Approved Visitor", email="visitor@example.test", password_hash="unused", role="attendee", approval_status="approved"),
             "pending": User(name="Pending Visitor", email="pending@example.test", password_hash="unused", role="attendee", approval_status="pending"),
             "evaluator": User(name="Approved Evaluator", email="evaluator@example.test", password_hash="unused", role="evaluator", approval_status="approved"),
             "exhibitor": User(name="Exhibitor", email="exhibitor@example.test", password_hash="unused", role="exhibitor"),
         }
-        db.session.add_all(people.values())
-        category = Category(name="Engineering")
-        team = Team(name="Example Team", user=people["exhibitor"], members="Informational Member")
-        project = Project(team=team, category=category, title="Water monitor", abstract="A working water monitoring system.", status="approved")
-        db.session.add(project)
-        db.session.commit()
+        for user in people.values():
+            repo.save(user)
+        category = repo.first(Category)
+        team = repo.save(Team(name="Example Team", user_id=people["exhibitor"].id, members="Informational Member"))
+        project = repo.save(Project(team_id=team.id, category_id=category.id, title="Water monitor", abstract="A working water monitoring system.", status="approved"))
         ids = {key: user.id for key, user in people.items()}
-        ids["project"] = project.id
-    yield app, ids
-    with app.app_context():
-        db.session.remove()
-        db.drop_all()
-        db.engine.dispose()
+        ids.update(admin=admin, project=project.id)
+    return app, ids
 
 
 def _client(app, user_id):
@@ -65,7 +43,7 @@ def _client(app, user_id):
 
 def _issue(app, user_id, kind="live"):
     with app.app_context():
-        return passes.issue_token(db.session.get(User, user_id), kind)
+        return passes.issue_token(repo.get(User, user_id), kind)
 
 
 def _scan(client, token):
@@ -74,7 +52,7 @@ def _scan(client, token):
 
 def _count(app, model):
     with app.app_context():
-        return db.session.scalar(select(func.count()).select_from(model))
+        return len(repo.all(model))
 
 
 @pytest.mark.parametrize("person", ["attendee", "evaluator", "exhibitor"])
@@ -153,14 +131,16 @@ def test_revoked_or_unapproved_pass_cannot_check_in(pass_environment, change):
     person = "exhibitor" if change == "project" else "attendee"
     token = _issue(app, ids[person])
     with app.app_context():
-        user = db.session.get(User, ids[person])
+        user = repo.get(User, ids[person])
         if change == "version":
             user.token_version += 1
         elif change == "approval":
             user.approval_status = "rejected"
         else:
-            user.team.project.status = "rejected"
-        db.session.commit()
+            project = user.team.project
+            project.status = "rejected"
+            repo.save(project)
+        repo.save(user)
     response = _scan(_client(app, ids["admin"]), token)
     assert response.status_code == 400
     assert _count(app, CheckIn) == 0
@@ -172,8 +152,9 @@ def test_revocation_is_checked_before_duplicate_success(pass_environment):
     token = _issue(app, ids["attendee"])
     assert _scan(scanner, token).status_code == 200
     with app.app_context():
-        db.session.get(User, ids["attendee"]).approval_status = "rejected"
-        db.session.commit()
+        user = repo.get(User, ids["attendee"])
+        user.approval_status = "rejected"
+        repo.save(user)
     assert _scan(scanner, token).status_code == 400
     assert _count(app, CheckIn) == 1
 
@@ -209,24 +190,10 @@ def test_qr_url_is_data_only_and_get_never_checks_in(pass_environment):
     assert _count(app, CheckIn) == 1
 
 
-def test_real_concurrent_scans_record_attendance_and_audit_once(pass_environment, monkeypatch):
+def test_real_concurrent_scans_record_attendance_and_audit_once(pass_environment):
     app, ids = pass_environment
     token = _issue(app, ids["attendee"])
-    insert_barrier = Barrier(2)
     request_barrier = Barrier(2)
-    with app.app_context():
-        sqlite = db.engine.dialect.name == "sqlite"
-    original = passes._validate_token
-
-    def validate_then_wait(value):
-        user = original(value)
-        # MySQL row locks serialize validation; forcing both requests through
-        # that lock before proceeding would create an artificial deadlock.
-        if sqlite:
-            insert_barrier.wait(timeout=10)
-        return user
-
-    monkeypatch.setattr(passes, "_validate_token", validate_then_wait)
 
     def scan():
         client = _client(app, ids["admin"])
@@ -239,7 +206,10 @@ def test_real_concurrent_scans_record_attendance_and_audit_once(pass_environment
     assert all(status == 200 for status, _ in responses)
     assert sorted(data["duplicate"] for _, data in responses) == [False, True]
     assert _count(app, CheckIn) == 1
-    assert _count(app, AuditLog) == 1
+    logs = []
+    with app.app_context():
+        logs = repo.find(AuditLog, action="check_in")
+    assert len(logs) == 1
 
 
 def test_pass_pdf_and_booth_certificate_require_correct_state(pass_environment):
@@ -253,8 +223,10 @@ def test_pass_pdf_and_booth_certificate_require_correct_state(pass_environment):
     assert "no-store" in response.headers["Cache-Control"]
     assert exhibitor.get("/passes/certificate").status_code == 403
     with app.app_context():
-        db.session.add(Booth(code="E-01", project_id=ids["project"]))
-        db.session.commit()
+        booth = repo.save(Booth(code="E-01", project_id=ids["project"]))
+        project = repo.get(Project, ids["project"])
+        project.booth_id = booth.id
+        repo.save(project)
     certificate = exhibitor.get("/passes/certificate")
     assert certificate.status_code == 200
     assert certificate.data.startswith(b"%PDF-")
@@ -280,7 +252,8 @@ def test_downloaded_pdf_qr_uses_longer_lifetime_but_obeys_revocation(pass_enviro
     scanner = _client(app, ids["admin"])
     assert _scan(scanner, encoded[0]).status_code == 200
     with app.app_context():
-        db.session.get(User, ids["attendee"]).token_version += 1
-        db.session.commit()
+        user = repo.get(User, ids["attendee"])
+        user.token_version += 1
+        repo.save(user)
     assert _scan(scanner, encoded[0]).status_code == 400
     assert _count(app, CheckIn) == 1

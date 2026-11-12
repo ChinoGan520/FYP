@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Browser/mobile SDK clients have no direct access. Flask authenticates
+    // users itself and uses server credentials authorized by Google Cloud IAM.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

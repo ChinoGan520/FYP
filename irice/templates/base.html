@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
   {% block head %}{% endblock %}
 </head>
-<body class="{{ 'app-body' if current_user else 'public-body' }}" {% if request.endpoint in ['participant.dashboard','admin.dashboard'] %}data-refresh="30000"{% endif %}>
+<body class="{{ 'app-body' if current_user else 'public-body' }}">
 <a class="skip-link" href="#main-content">Skip to main content</a>
 {% if current_user %}
   <button class="sidebar-shade" type="button" aria-label="Close navigation" data-close-nav></button>

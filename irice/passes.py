@@ -17,12 +17,10 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 
 from .auth import admin_required, login_required
-from .extensions import db
-from .models import AuditLog, CheckIn, Project, Team, User
+from .models import CheckIn, User
+from .repository import BackendUnavailable, repo
 
 
 bp = Blueprint("passes", __name__, url_prefix="/passes")
@@ -204,11 +202,12 @@ def _extract_token(value):
 
 
 def _validate_token(value):
+    """Verify signed content without reading a potentially stale admission."""
     serializer = _serializer()
     payload = serializer.loads(value, max_age=TOKEN_LIFETIMES["download"])
     if not isinstance(payload, dict):
         raise ValueError("Invalid admission pass.")
-    if type(payload.get("uid")) is not int or payload["uid"] < 1:
+    if type(payload.get("uid")) is not int or not 1 <= payload["uid"] <= 2**31 - 1:
         raise ValueError("Invalid admission pass.")
     if type(payload.get("v")) is not int or payload["v"] < 1:
         raise ValueError("Invalid admission pass.")
@@ -217,23 +216,16 @@ def _validate_token(value):
         raise ValueError("Invalid admission pass.")
     # Recheck the signed timestamp against the authenticated token kind's limit.
     serializer.loads(value, max_age=TOKEN_LIFETIMES[kind])
-    user = db.session.scalar(
-        select(User).where(User.id == payload["uid"]).with_for_update()
-        .execution_options(populate_existing=True)
-    )
+    return payload
+
+
+def _validate_admission(payload):
+    """Read eligibility/version afresh inside the check-in transaction."""
+    user = repo.get(User, payload["uid"])
     if user is None:
         raise ValueError("This admission registration no longer exists.")
     if payload["v"] != user.token_version:
         raise ValueError("This admission pass has been revoked. Ask the participant to refresh it.")
-    if user.role == "exhibitor":
-        # A locking read observes the latest approval even under MySQL's default
-        # repeatable-read isolation rather than an earlier request snapshot.
-        project = db.session.scalar(
-            select(Project).join(Team).where(Team.user_id == user.id)
-            .with_for_update().execution_options(populate_existing=True)
-        )
-        if project is None or project.status != "approved":
-            raise ValueError("The exhibitor's project is not currently approved.")
     eligible, reason = pass_eligibility(user)
     if not eligible:
         raise ValueError(reason)
@@ -256,7 +248,7 @@ def checkin():
         return _error("Send a JSON object containing an admission token.")
     try:
         value = _extract_token(data.get("token"))
-        user = _validate_token(value)
+        payload = _validate_token(value)
     except SignatureExpired:
         return _error("This QR code has expired. Ask the participant to refresh their pass.")
     except BadData:
@@ -266,21 +258,38 @@ def checkin():
     except TypeError:
         return _error("Invalid admission pass.")
 
-    existing = db.session.scalar(select(CheckIn).where(CheckIn.user_id == user.id))
-    if existing:
-        return _checkin_result(existing, user, True)
-    admission_user_id = user.id
-    record = CheckIn(user_id=admission_user_id, scanner_id=g.user.id)
-    db.session.add(record)
-    db.session.add(AuditLog(user_id=g.user.id, action="check_in", details=f"Recorded admission for user #{admission_user_id}."))
+    scanner_id = g.user.id
+
+    def record_admission():
+        # Every retry reloads all authorization and admission state. In
+        # particular, no g.user/domain object from outside this transaction
+        # supplies mutable approval or role information.
+        organizer = repo.get(User, scanner_id)
+        if organizer is None or organizer.role != "admin":
+            raise PermissionError("Organizer access is required to check in participants.")
+        user = _validate_admission(payload)
+        existing = repo.get(CheckIn, user.id)
+        # Scans and approval changes write the same user document. Firestore
+        # detects concurrent revocation and reruns this callback against fresh
+        # state, including when a duplicate is scanned.
+        repo.save(user)
+        if existing is not None:
+            if existing.user_id != user.id:
+                raise ValueError("This admission record could not be verified. Contact an organizer.")
+            return existing, user, True
+        # One deterministic document per registered person makes duplicate
+        # attendance impossible even when multiple scanners race.
+        record = CheckIn(id=user.id, user_id=user.id, scanner_id=scanner_id)
+        repo.save(record)
+        repo.audit(scanner_id, "check_in", f"Recorded admission for user #{user.id}.")
+        return record, user, False
+
     try:
-        db.session.commit()
-    except IntegrityError:
-        # A second organizer can win the race after our initial lookup. The
-        # database uniqueness constraint is the source of truth for attendance.
-        db.session.rollback()
-        existing = db.session.scalar(select(CheckIn).where(CheckIn.user_id == admission_user_id))
-        if existing is None:
-            return _error("Check-in could not be recorded. Please try again.", 409)
-        return _checkin_result(existing, db.session.get(User, admission_user_id), True)
-    return _checkin_result(record, user, False)
+        record, user, duplicate = repo.atomic(record_admission)
+    except PermissionError as exc:
+        return _error(str(exc), 403)
+    except ValueError as exc:
+        return _error(str(exc))
+    except BackendUnavailable:
+        return _error("Check-in is temporarily unavailable. Please try again.", 503)
+    return _checkin_result(record, user, duplicate)
