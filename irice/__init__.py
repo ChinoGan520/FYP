@@ -99,9 +99,9 @@ def create_app(test_config=None):
 
     @app.errorhandler(BackendUnavailable)
     def backend_failure(error):
-        app.logger.warning('Application data backend is unavailable; check Firebase configuration and service access.')
+        app.logger.warning('Application data backend unavailable: %s', error.code)
         if request.path == '/health':
-            response = jsonify(status='error', database='unavailable', backend=app.config['DATA_BACKEND'])
+            response = jsonify(status='error', database='unavailable', backend=app.config['DATA_BACKEND'], reason=error.code)
         elif request.is_json:
             response = jsonify(ok=False, message='The data service is temporarily unavailable. Please try again shortly.')
         else:

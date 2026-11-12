@@ -172,3 +172,21 @@ Firebase Spark 有免费配额，并非无限容量或无限请求。标准 Fire
 - **Firestore 规则拒绝客户端访问：**这是预期行为。系统通过服务器访问，不能为此把规则改为公开。
 - **相机打不开：**确认部署使用 HTTPS、浏览器已允许相机，并在实际设备上测试；可使用相同验证逻辑的手动 token 字段。
 - **旧 MySQL 数据没有出现：**这次按用户确认的全新 Firestore 开始，没有迁移旧数据。旧 Aiven 服务与旧本机数据不会被此应用自动删除。
+
+## `/health` 的安全诊断代号
+
+连接失败时 HTTP503 的 JSON 会包含 `reason`。这里只显示固定代号，不回传密钥、原始异常、完整服务账号或连接信息；可以只分享这个代号排错。
+
+| reason | 下一步 |
+| --- | --- |
+| `PROJECT_ID_MISSING` | 在当前部署环境设置 `FIREBASE_PROJECT_ID`，重新部署。 |
+| `SERVICE_ACCOUNT_MISSING` | 在 Vercel 设置完整 `FIREBASE_SERVICE_ACCOUNT_JSON`，重新部署。 |
+| `SERVICE_ACCOUNT_JSON_INVALID` | 确认粘贴完整服务账号 JSON 对象，而不是文件路径、网页 firebaseConfig 或包在额外引号内的字符串。 |
+| `PROJECT_ID_MISMATCH` | 环境变量项目 ID 必须和 JSON 内的 `project_id` 完全一致。 |
+| `SERVICE_ACCOUNT_INVALID` | 重新下载有效服务账号 JSON，并完整保留私钥的 JSON 转义格式。不要公开私钥。 |
+| `FIRESTORE_PERMISSION_DENIED` | 确认服务账号对目标项目有 `Cloud Datastore User` 权限，且 Cloud Firestore API 已启用；客户端规则无需开放。 |
+| `FIRESTORE_NOT_FOUND` | 确认目标项目已建立 Firestore Native／Standard 的 `(default)` 数据库。 |
+| `FIRESTORE_UNAUTHENTICATED` | 检查服务账号／密钥是否已停用、删除或撤销；在安全设置中更新有效凭据后重新部署。 |
+| `FIRESTORE_NETWORK_UNAVAILABLE` | 检查平台到 Google 服务的连接与暂时性故障；这不等于密码错误。 |
+| `EMULATOR_NOT_ALLOWED` | 从 Vercel 移除 `FIRESTORE_EMULATOR_HOST`，正式部署只能连接真实项目。 |
+| `FIRESTORE_CONFIG_INVALID` 或 `BACKEND_UNAVAILABLE` | 已知代号不足以确定原因，继续检查部署设置及受保护的运行环境；不要把完整凭据写入日志。 |

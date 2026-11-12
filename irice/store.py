@@ -9,6 +9,8 @@ import json
 import os
 import re
 import sqlite3
+import time
+import random
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,28 @@ from pathlib import Path
 
 class BackendUnavailable(Exception):
     """Safe application-facing failure; never includes credentials or raw RPC data."""
+    CODES = frozenset({'BACKEND_UNAVAILABLE', 'PROJECT_ID_MISSING', 'SERVICE_ACCOUNT_MISSING',
+        'SERVICE_ACCOUNT_JSON_INVALID', 'PROJECT_ID_MISMATCH', 'SERVICE_ACCOUNT_INVALID',
+        'EMULATOR_NOT_ALLOWED', 'FIRESTORE_PERMISSION_DENIED', 'FIRESTORE_NOT_FOUND',
+        'FIRESTORE_UNAUTHENTICATED', 'FIRESTORE_NETWORK_UNAVAILABLE', 'FIRESTORE_CONFIG_INVALID'})
+
+    def __init__(self, message, code='BACKEND_UNAVAILABLE'):
+        super().__init__(message)
+        self.code = code if code in self.CODES else 'BACKEND_UNAVAILABLE'
+
+
+def firebase_failure(error):
+    from google.api_core import exceptions
+    from google.auth.exceptions import GoogleAuthError
+    codes = ((exceptions.PermissionDenied, 'FIRESTORE_PERMISSION_DENIED'),
+             (exceptions.NotFound, 'FIRESTORE_NOT_FOUND'),
+             (exceptions.Unauthenticated, 'FIRESTORE_UNAUTHENTICATED'),
+             (GoogleAuthError, 'FIRESTORE_UNAUTHENTICATED'),
+             ((exceptions.ServiceUnavailable, exceptions.DeadlineExceeded), 'FIRESTORE_NETWORK_UNAVAILABLE'))
+    for kind, code in codes:
+        if isinstance(error, kind):
+            return BackendUnavailable('Firebase is unavailable. Check the health diagnostic code.', code)
+    return BackendUnavailable('Firebase could not be reached.')
 
 
 class UnitOfWork:
@@ -128,23 +152,33 @@ class FirestoreStore:
                         from google.oauth2 import service_account
                         from google.auth.credentials import AnonymousCredentials
                         if not self.project:
-                            raise ValueError('FIREBASE_PROJECT_ID must be configured.')
+                            raise BackendUnavailable('Configure the Firebase project ID.', 'PROJECT_ID_MISSING')
                         if os.environ.get('FIRESTORE_EMULATOR_HOST'):
                             if self.deployed:
-                                raise ValueError('Emulator configuration is not allowed on Vercel.')
+                                raise BackendUnavailable('Remove emulator settings from Vercel.', 'EMULATOR_NOT_ALLOWED')
                             credential = AnonymousCredentials()
                         elif self.credential_json:
-                            info = json.loads(self.credential_json)
+                            try:
+                                info = json.loads(self.credential_json)
+                            except (ValueError, TypeError):
+                                raise BackendUnavailable('Provide the complete service account JSON.', 'SERVICE_ACCOUNT_JSON_INVALID') from None
+                            if not isinstance(info, dict) or info.get('type') != 'service_account':
+                                raise BackendUnavailable('Provide a service account JSON, not web configuration.', 'SERVICE_ACCOUNT_JSON_INVALID')
                             if info.get('project_id') != self.project:
-                                raise ValueError('Firebase project and service account must match.')
-                            credential = service_account.Credentials.from_service_account_info(info)
+                                raise BackendUnavailable('Project ID and service account must match.', 'PROJECT_ID_MISMATCH')
+                            try:
+                                credential = service_account.Credentials.from_service_account_info(info)
+                            except Exception:
+                                raise BackendUnavailable('The service account key is incomplete or invalid.', 'SERVICE_ACCOUNT_INVALID') from None
                         else:
                             if self.deployed:
-                                raise ValueError('FIREBASE_SERVICE_ACCOUNT_JSON must be configured on Vercel.')
+                                raise BackendUnavailable('Configure the service account JSON on Vercel.', 'SERVICE_ACCOUNT_MISSING')
                             credential = None  # Local Application Default Credentials, if configured.
                         self._client = firestore.Client(project=self.project, credentials=credential)
+                    except BackendUnavailable:
+                        raise
                     except Exception:
-                        raise BackendUnavailable('Firebase configuration is missing or invalid.') from None
+                        raise BackendUnavailable('Firebase configuration is missing or invalid.', 'FIRESTORE_CONFIG_INVALID') from None
         return self._client
 
     def collection(self, name):
@@ -166,16 +200,16 @@ class FirestoreStore:
             return self._get(collection, key)
         except BackendUnavailable:
             raise
-        except Exception:
-            raise BackendUnavailable('Firebase could not be reached.') from None
+        except Exception as error:
+            raise firebase_failure(error) from None
 
     def scan(self, collection, filters):
         try:
             return self._scan(collection, filters)
         except BackendUnavailable:
             raise
-        except Exception:
-            raise BackendUnavailable('Firebase could not be reached.') from None
+        except Exception as error:
+            raise firebase_failure(error) from None
 
     def atomic(self, callback):
         from google.api_core.exceptions import Aborted, GoogleAPICallError, RetryError
@@ -194,11 +228,20 @@ class FirestoreStore:
                     transaction.set(reference, data)
             return result
         try:
-            return execute(self.client.transaction(max_attempts=5))
+            # Firestore can abort a transaction while acquiring a read lock,
+            # before the SDK's commit-only retry loop is entered. Retry that
+            # complete attempt as well; never retry business validation errors.
+            for attempt in range(5):
+                try:
+                    return execute(self.client.transaction(max_attempts=5))
+                except Aborted:
+                    if attempt == 4:
+                        raise
+                    time.sleep(random.uniform(0.02, 0.08) * (attempt + 1))
         except BackendUnavailable:
             raise
-        except (GoogleAPICallError, RetryError):
-            raise BackendUnavailable('Firebase is temporarily unavailable. Try again shortly.') from None
+        except (GoogleAPICallError, RetryError) as error:
+            raise firebase_failure(error) from None
         except ValueError as error:
             if isinstance(error.__cause__, Aborted):
                 raise BackendUnavailable('Firebase is busy. Please try again shortly.') from None
